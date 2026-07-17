@@ -22,31 +22,50 @@ npm run dev
 npm run deploy
 ```
 
+## Authentication
+
+The MCP server authenticates via **Bearer token**. Generate an API key from your Lokahi account at **Settings → API Access** on [app.lokahi.life](https://app.lokahi.life/settings). Keys start with `lok_live_` and are shown once at creation time.
+
+The server accepts the API key in two ways (checked in order):
+1. `Authorization: Bearer lok_live_...` header (preferred)
+2. `?apiKey=lok_live_...` query parameter (fallback)
+
+Public tools (search, practitioner profiles) work without auth. Seeker and practitioner tools require a valid API key.
+
 ## Connecting
 
 ### Claude.ai (remote MCP)
 
-Add the worker URL as a remote MCP server in your Claude.ai connector settings. Pass your Lokahi API key as a connection parameter.
+1. Go to **Claude.ai → Settings → Connectors → Add MCP Server**
+2. URL: `https://lokahi-mcp.<your-subdomain>.workers.dev/sse`
+3. Add your API key as a custom header: `Authorization: Bearer lok_live_...`
 
 ### Claude Desktop / Cursor
 
-Add to your MCP config:
+Add to your MCP config (e.g. `~/.claude/claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
     "lokahi": {
-      "url": "https://lokahi-mcp.<your-subdomain>.workers.dev/sse"
+      "url": "https://lokahi-mcp.<your-subdomain>.workers.dev/sse",
+      "headers": {
+        "Authorization": "Bearer lok_live_YOUR_KEY_HERE"
+      }
     }
   }
 }
 ```
 
-## API Key
+### ChatGPT (GPT Actions)
 
-Generate an API key from your Lokahi account at **Settings → API Access** on [app.lokahi.life](https://app.lokahi.life/settings).
+ChatGPT uses OpenAPI specs directly instead of MCP. Point it at the OpenAPI endpoint:
 
-Keys start with `lok_live_` and are shown once at creation time.
+```
+https://app.lokahi.life/_/api/v1/openapi.json
+```
+
+Then configure authentication as API key with `Bearer` prefix in the Authorization header.
 
 ## Available Tools
 

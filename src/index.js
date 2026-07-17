@@ -45,12 +45,6 @@ function result(data) {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
 }
 
-function getKey(server) {
-  const key = server.props?.apiKey;
-  if (!key) throw new Error("API key not configured. Pass your Lokahi API key when connecting.");
-  return key;
-}
-
 // ── MCP Server ──
 
 export class LokahiMCP extends McpAgent {
@@ -58,6 +52,26 @@ export class LokahiMCP extends McpAgent {
     name: "Lokahi",
     version: "1.0.0",
   });
+
+  _apiKey = null;
+
+  async fetch(request) {
+    const auth = request.headers.get("Authorization");
+    if (auth?.startsWith("Bearer ")) {
+      this._apiKey = auth.slice(7);
+    }
+    if (!this._apiKey) {
+      const url = new URL(request.url);
+      const qp = url.searchParams.get("apiKey");
+      if (qp) this._apiKey = qp;
+    }
+    return super.fetch(request);
+  }
+
+  _requireKey() {
+    if (!this._apiKey) throw new Error("Not authenticated. Pass your Lokahi API key as a Bearer token in the Authorization header.");
+    return this._apiKey;
+  }
 
   async init() {
     // ── Public tools (no auth) ──
@@ -158,7 +172,7 @@ export class LokahiMCP extends McpAgent {
       },
       async ({ upcoming, status, limit }) => {
         const data = await api("/bookings", {
-          apiKey: getKey(this),
+          apiKey: this._requireKey(),
           query: { upcoming: upcoming ? "true" : undefined, status, limit },
         });
         return result(data);
@@ -170,7 +184,7 @@ export class LokahiMCP extends McpAgent {
       "Get details of a specific booking by its reference ID",
       { ref: z.string().describe("Booking reference ID") },
       async ({ ref }) => {
-        const data = await api(`/bookings/${ref}`, { apiKey: getKey(this) });
+        const data = await api(`/bookings/${ref}`, { apiKey: this._requireKey() });
         return result(data);
       }
     );
@@ -190,7 +204,7 @@ export class LokahiMCP extends McpAgent {
       async ({ practitioner_slug, offering_id, session_type, duration_minutes, date, start_time, location_id }) => {
         const data = await api("/bookings", {
           method: "POST",
-          apiKey: getKey(this),
+          apiKey: this._requireKey(),
           body: { practitioner_slug, offering_id, session_type, duration_minutes, date, start_time, location_id },
         });
         return result(data);
@@ -202,7 +216,7 @@ export class LokahiMCP extends McpAgent {
       "Cancel one of your bookings",
       { ref: z.string().describe("Booking reference ID") },
       async ({ ref }) => {
-        const data = await api(`/bookings/${ref}/cancel`, { method: "POST", apiKey: getKey(this) });
+        const data = await api(`/bookings/${ref}/cancel`, { method: "POST", apiKey: this._requireKey() });
         return result(data);
       }
     );
@@ -218,7 +232,7 @@ export class LokahiMCP extends McpAgent {
       async ({ ref, date, start_time }) => {
         const data = await api(`/bookings/${ref}/reschedule`, {
           method: "POST",
-          apiKey: getKey(this),
+          apiKey: this._requireKey(),
           body: { date, start_time },
         });
         return result(data);
@@ -230,7 +244,7 @@ export class LokahiMCP extends McpAgent {
       "List your favourite practitioners",
       {},
       async () => {
-        const data = await api("/favourites", { apiKey: getKey(this) });
+        const data = await api("/favourites", { apiKey: this._requireKey() });
         return result(data);
       }
     );
@@ -240,7 +254,7 @@ export class LokahiMCP extends McpAgent {
       "Add or remove a practitioner from your favourites",
       { slug: z.string().describe("Practitioner slug") },
       async ({ slug }) => {
-        const data = await api(`/favourites/${slug}`, { method: "POST", apiKey: getKey(this) });
+        const data = await api(`/favourites/${slug}`, { method: "POST", apiKey: this._requireKey() });
         return result(data);
       }
     );
@@ -250,7 +264,7 @@ export class LokahiMCP extends McpAgent {
       "List your message conversations with practitioners",
       {},
       async () => {
-        const data = await api("/conversations", { apiKey: getKey(this) });
+        const data = await api("/conversations", { apiKey: this._requireKey() });
         return result(data);
       }
     );
@@ -265,7 +279,7 @@ export class LokahiMCP extends McpAgent {
       },
       async ({ conversation_id, limit, before }) => {
         const data = await api(`/conversations/${conversation_id}/messages`, {
-          apiKey: getKey(this),
+          apiKey: this._requireKey(),
           query: { limit, before },
         });
         return result(data);
@@ -282,7 +296,7 @@ export class LokahiMCP extends McpAgent {
       async ({ slug, text }) => {
         const data = await api(`/conversations/${slug}/send`, {
           method: "POST",
-          apiKey: getKey(this),
+          apiKey: this._requireKey(),
           body: { text },
         });
         return result(data);
@@ -296,7 +310,7 @@ export class LokahiMCP extends McpAgent {
       "Get your practitioner dashboard (today's schedule, recent messages, reviews, stats)",
       {},
       async () => {
-        const data = await api("/practitioner/dashboard", { apiKey: getKey(this) });
+        const data = await api("/practitioner/dashboard", { apiKey: this._requireKey() });
         return result(data);
       }
     );
@@ -306,7 +320,7 @@ export class LokahiMCP extends McpAgent {
       "List your practitioner offerings",
       {},
       async () => {
-        const data = await api("/practitioner/offerings", { apiKey: getKey(this) });
+        const data = await api("/practitioner/offerings", { apiKey: this._requireKey() });
         return result(data);
       }
     );
@@ -328,7 +342,7 @@ export class LokahiMCP extends McpAgent {
       async ({ name, description, modality, session_types, durations, prices, currency, auto_accept, location_ids }) => {
         const data = await api("/practitioner/offerings", {
           method: "POST",
-          apiKey: getKey(this),
+          apiKey: this._requireKey(),
           body: { name, description, modality, session_types, durations, prices, currency, auto_accept, location_ids },
         });
         return result(data);
@@ -353,7 +367,7 @@ export class LokahiMCP extends McpAgent {
       async ({ offering_id, name, description, modality, session_types, durations, prices, currency, auto_accept, location_ids }) => {
         const data = await api(`/practitioner/offerings/${offering_id}`, {
           method: "PUT",
-          apiKey: getKey(this),
+          apiKey: this._requireKey(),
           body: { name, description, modality, session_types, durations, prices, currency, auto_accept, location_ids },
         });
         return result(data);
@@ -367,7 +381,7 @@ export class LokahiMCP extends McpAgent {
       async ({ offering_id }) => {
         const data = await api(`/practitioner/offerings/${offering_id}`, {
           method: "DELETE",
-          apiKey: getKey(this),
+          apiKey: this._requireKey(),
         });
         return result(data);
       }
@@ -379,7 +393,7 @@ export class LokahiMCP extends McpAgent {
       { status: z.string().optional().describe("Filter by status") },
       async ({ status }) => {
         const data = await api("/practitioner/bookings", {
-          apiKey: getKey(this),
+          apiKey: this._requireKey(),
           query: { status },
         });
         return result(data);
@@ -391,7 +405,7 @@ export class LokahiMCP extends McpAgent {
       "Get details of a specific booking as a practitioner",
       { ref: z.string().describe("Booking reference ID") },
       async ({ ref }) => {
-        const data = await api(`/practitioner/bookings/${ref}`, { apiKey: getKey(this) });
+        const data = await api(`/practitioner/bookings/${ref}`, { apiKey: this._requireKey() });
         return result(data);
       }
     );
@@ -401,7 +415,7 @@ export class LokahiMCP extends McpAgent {
       "Accept a pending booking",
       { ref: z.string().describe("Booking reference ID") },
       async ({ ref }) => {
-        const data = await api(`/practitioner/bookings/${ref}/accept`, { method: "POST", apiKey: getKey(this) });
+        const data = await api(`/practitioner/bookings/${ref}/accept`, { method: "POST", apiKey: this._requireKey() });
         return result(data);
       }
     );
@@ -411,7 +425,7 @@ export class LokahiMCP extends McpAgent {
       "Decline a pending booking",
       { ref: z.string().describe("Booking reference ID") },
       async ({ ref }) => {
-        const data = await api(`/practitioner/bookings/${ref}/decline`, { method: "POST", apiKey: getKey(this) });
+        const data = await api(`/practitioner/bookings/${ref}/decline`, { method: "POST", apiKey: this._requireKey() });
         return result(data);
       }
     );
@@ -421,7 +435,7 @@ export class LokahiMCP extends McpAgent {
       "Cancel a booking as the practitioner",
       { ref: z.string().describe("Booking reference ID") },
       async ({ ref }) => {
-        const data = await api(`/practitioner/bookings/${ref}/cancel`, { method: "POST", apiKey: getKey(this) });
+        const data = await api(`/practitioner/bookings/${ref}/cancel`, { method: "POST", apiKey: this._requireKey() });
         return result(data);
       }
     );
@@ -431,7 +445,7 @@ export class LokahiMCP extends McpAgent {
       "Mark a booking as completed",
       { ref: z.string().describe("Booking reference ID") },
       async ({ ref }) => {
-        const data = await api(`/practitioner/bookings/${ref}/complete`, { method: "POST", apiKey: getKey(this) });
+        const data = await api(`/practitioner/bookings/${ref}/complete`, { method: "POST", apiKey: this._requireKey() });
         return result(data);
       }
     );
@@ -442,7 +456,7 @@ export class LokahiMCP extends McpAgent {
       { location_id: z.string().optional().describe("Location ID") },
       async ({ location_id }) => {
         const data = await api("/practitioner/availability", {
-          apiKey: getKey(this),
+          apiKey: this._requireKey(),
           query: { location_id },
         });
         return result(data);
@@ -462,7 +476,7 @@ export class LokahiMCP extends McpAgent {
       async ({ schedule, location_id }) => {
         const data = await api("/practitioner/availability", {
           method: "PUT",
-          apiKey: getKey(this),
+          apiKey: this._requireKey(),
           body: { schedule, location_id },
         });
         return result(data);
@@ -481,7 +495,7 @@ export class LokahiMCP extends McpAgent {
       async ({ date, is_blocked, slots, location_id }) => {
         const data = await api("/practitioner/availability/override", {
           method: "POST",
-          apiKey: getKey(this),
+          apiKey: this._requireKey(),
           body: { date, is_blocked, slots, location_id },
         });
         return result(data);
@@ -498,7 +512,7 @@ export class LokahiMCP extends McpAgent {
       async ({ date, location_id }) => {
         const data = await api("/practitioner/availability/override", {
           method: "DELETE",
-          apiKey: getKey(this),
+          apiKey: this._requireKey(),
           query: { date, location_id },
         });
         return result(data);
@@ -510,7 +524,7 @@ export class LokahiMCP extends McpAgent {
       "List message conversations as a practitioner",
       {},
       async () => {
-        const data = await api("/practitioner/conversations", { apiKey: getKey(this) });
+        const data = await api("/practitioner/conversations", { apiKey: this._requireKey() });
         return result(data);
       }
     );
@@ -525,7 +539,7 @@ export class LokahiMCP extends McpAgent {
       async ({ conversation_id, text }) => {
         const data = await api(`/practitioner/conversations/${conversation_id}/send`, {
           method: "POST",
-          apiKey: getKey(this),
+          apiKey: this._requireKey(),
           body: { text },
         });
         return result(data);
@@ -537,7 +551,7 @@ export class LokahiMCP extends McpAgent {
       "Get your practitioner profile",
       {},
       async () => {
-        const data = await api("/practitioner/profile", { apiKey: getKey(this) });
+        const data = await api("/practitioner/profile", { apiKey: this._requireKey() });
         return result(data);
       }
     );
@@ -560,7 +574,7 @@ export class LokahiMCP extends McpAgent {
       async ({ first_name, last_name, quote, bio, modalities, specialties, languages, address, certifications, is_active }) => {
         const data = await api("/practitioner/profile", {
           method: "PUT",
-          apiKey: getKey(this),
+          apiKey: this._requireKey(),
           body: { first_name, last_name, quote, bio, modalities, specialties, languages, address, certifications, is_active },
         });
         return result(data);
