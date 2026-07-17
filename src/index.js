@@ -85,6 +85,14 @@ function oauthError(error, description, status = 400) {
 
 // ── OAuth endpoints ──
 
+function handleProtectedResource(host) {
+  return jsonResponse({
+    resource: `https://${host}`,
+    authorization_servers: [`https://${host}`],
+    bearer_methods_supported: ["header"],
+  });
+}
+
 function handleDiscovery(host) {
   return jsonResponse({
     issuer: `https://${host}`,
@@ -163,7 +171,7 @@ async function handleAuthorize(request, env) {
 
   const host = url.host;
   const callbackUrl = `https://${host}/oauth/callback`;
-  const consentUrl = `${ANVIL_APP}/#oauth-consent?session_id=${session_id}&callback_url=${encodeURIComponent(callbackUrl)}`;
+  const consentUrl = `${ANVIL_APP}/oauth/consent?session_id=${session_id}&callback_url=${encodeURIComponent(callbackUrl)}`;
 
   return Response.redirect(consentUrl, 302);
 }
@@ -389,34 +397,37 @@ export class LokahiMCP extends McpAgent {
 
   _apiKey = null;
 
+  async init() {
+    console.log("[MCP DO] init() called — registering tools");
+    if (this.props?.apiKey) {
+      this._apiKey = this.props.apiKey;
+      console.log("[MCP DO] apiKey set from props");
+    }
+    await this._registerTools();
+  }
+
   async fetch(request) {
-    const auth = request.headers.get("Authorization");
-    if (auth?.startsWith("Bearer ")) {
-      const token = auth.slice(7);
-      if (token.startsWith("lok_live_")) {
-        // Direct API key
-        this._apiKey = token;
-      } else {
-        // OAuth access token — look up in KV
-        try {
-          const tokenRaw = await this.env.OAUTH_KV.get(`access:${token}`);
-          if (tokenRaw) {
-            const tokenData = JSON.parse(tokenRaw);
-            this._apiKey = tokenData.api_key;
-          } else {
-            this._apiKey = token; // Let it fail downstream with a clear error
-          }
-        } catch {
+    const url = new URL(request.url);
+    console.log(`[MCP DO] fetch ${request.method} ${url.pathname}`);
+    if (!this._apiKey) {
+      const auth = request.headers.get("Authorization");
+      if (auth?.startsWith("Bearer ")) {
+        const token = auth.slice(7);
+        if (token.startsWith("lok_live_")) {
           this._apiKey = token;
+          console.log("[MCP DO] auth: direct API key from header");
         }
       }
     }
-    if (!this._apiKey) {
-      const url = new URL(request.url);
-      const qp = url.searchParams.get("apiKey");
-      if (qp) this._apiKey = qp;
+    console.log(`[MCP DO] apiKey set: ${!!this._apiKey}`);
+    try {
+      const resp = await super.fetch(request);
+      console.log(`[MCP DO] super.fetch response: ${resp.status}`);
+      return resp;
+    } catch (err) {
+      console.error(`[MCP DO] super.fetch error: ${err.message}`);
+      throw err;
     }
-    return super.fetch(request);
   }
 
   _requireKey() {
@@ -424,23 +435,28 @@ export class LokahiMCP extends McpAgent {
     return this._apiKey;
   }
 
-  async init() {
+  async _registerTools() {
     // ── Public tools (no auth) ──
 
     this.server.tool(
       "search_practitioners",
-      "Search for wellness practitioners by keyword, specialty, or location",
+      "Search for wellness practitioners. At least one of: q (keyword), specialty, or lat/lon is required. Returns max 20 results per page, max 5 pages.",
       {
-        q: z.string().optional().describe("Search query (name, modality, keyword)"),
+        q: z.string().optional().describe("Search query (name, modality, keyword) — required if no specialty or lat/lon"),
         specialty: z.string().optional().describe("Filter by specialty"),
         lat: z.number().optional().describe("Latitude for location search"),
         lon: z.number().optional().describe("Longitude for location search"),
         radius_km: z.number().optional().describe("Search radius in km (default 50)"),
-        page: z.number().optional().describe("Page number (default 1)"),
-        page_size: z.number().optional().describe("Results per page (default 10, max 50)"),
+        page: z.number().optional().describe("Page number (default 1, max 5)"),
+        page_size: z.number().optional().describe("Results per page (default 10, max 20)"),
       },
       async ({ q, specialty, lat, lon, radius_km, page, page_size }) => {
-        const data = await api("/search", { query: { q, specialty, lat, lon, radius_km, page, page_size } });
+        if (!q && !specialty && lat == null) {
+          return { content: [{ type: "text", text: "Error: At least one search parameter required: q, specialty, or lat/lon" }], isError: true };
+        }
+        const data = await api("/search", {
+          query: { q, specialty, lat, lon, radius_km, page: Math.min(page || 1, 5), page_size: Math.min(page_size || 10, 20) },
+        });
         return result(data);
       }
     );
@@ -639,7 +655,7 @@ export class LokahiMCP extends McpAgent {
 
     this.server.tool(
       "send_message",
-      "Send a message to a practitioner",
+      "Send an introductory message to a practitioner. Limited to one initial message per practitioner — continue conversations through the Lokahi app.",
       {
         slug: z.string().describe("Practitioner slug"),
         text: z.string().describe("Message text"),
@@ -935,32 +951,42 @@ export class LokahiMCP extends McpAgent {
 }
 
 export default {
-  fetch(request, env, ctx) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    console.log(`[Worker] ${request.method} ${url.pathname}`);
 
     // ── OAuth routes ──
+    if (url.pathname === "/.well-known/oauth-protected-resource") {
+      console.log("[Worker] → protected-resource metadata");
+      return handleProtectedResource(url.host);
+    }
     if (url.pathname === "/.well-known/oauth-authorization-server") {
+      console.log("[Worker] → discovery");
       return handleDiscovery(url.host);
     }
     if (url.pathname === "/oauth/register" && request.method === "POST") {
+      console.log("[Worker] → register");
       return handleRegister(request, env);
     }
     if (url.pathname === "/oauth/authorize" && request.method === "GET") {
+      console.log("[Worker] → authorize");
       return handleAuthorize(request, env);
     }
     if (url.pathname === "/oauth/callback" && request.method === "GET") {
+      console.log("[Worker] → callback");
       return handleCallback(request, env);
     }
     if (url.pathname === "/oauth/token" && request.method === "POST") {
+      console.log("[Worker] → token");
       return handleToken(request, env);
     }
 
-    // ── Root info page ──
-    if (url.pathname === "/") {
+    // ── Info page at /info (not root — root is the MCP endpoint) ──
+    if (url.pathname === "/info" && request.method === "GET") {
       return new Response(
         JSON.stringify({
           name: "Lokahi MCP Server",
-          description: "MCP server for the Lokahi wellness marketplace. Connect via /sse with your API key, or use OAuth for Claude.ai / ChatGPT.",
+          description: "MCP server for the Lokahi wellness marketplace. Connect with your API key or use OAuth for Claude.ai / ChatGPT.",
           docs: "https://app.lokahi.life/_/api/v1/docs",
           openapi: "https://app.lokahi.life/_/api/v1/openapi.json",
         }),
@@ -968,7 +994,40 @@ export default {
       );
     }
 
-    // ── MCP SSE ──
-    return LokahiMCP.serve(url.pathname).fetch(request, env, ctx);
+    // ── Resolve auth token before MCP serve (headers are stripped during internal WebSocket upgrade) ──
+    let apiKey = null;
+    const auth = request.headers.get("Authorization");
+    if (auth?.startsWith("Bearer ")) {
+      const token = auth.slice(7);
+      if (token.startsWith("lok_live_")) {
+        apiKey = token;
+        console.log("[Worker] auth: direct API key");
+      } else {
+        try {
+          const tokenRaw = await env.OAUTH_KV.get(`access:${token}`);
+          if (tokenRaw) {
+            const tokenData = JSON.parse(tokenRaw);
+            apiKey = tokenData.api_key;
+            console.log("[Worker] auth: OAuth token resolved to API key");
+          } else {
+            console.log("[Worker] auth: OAuth token NOT found in KV");
+          }
+        } catch (err) {
+          console.log(`[Worker] auth: KV lookup error: ${err.message}`);
+        }
+      }
+    }
+    ctx.props = { apiKey };
+
+    // ── MCP — serve at root for Streamable HTTP + SSE ──
+    console.log(`[Worker] → MCP serve for ${url.pathname} (${request.method})`);
+    try {
+      const resp = await LokahiMCP.serve("/").fetch(request, env, ctx);
+      console.log(`[Worker] MCP serve response: ${resp.status}`);
+      return resp;
+    } catch (err) {
+      console.error(`[Worker] MCP serve error: ${err.message}\n${err.stack}`);
+      return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+    }
   },
 };
