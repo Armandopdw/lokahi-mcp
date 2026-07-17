@@ -1,0 +1,17 @@
+{
+  "name": "lokahi-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for the Lokahi wellness marketplace API — search practitioners, book sessions, manage offerings, and more via AI assistants.",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "agents": "^0.0.87"
+  },
+  "devDependencies": {
+    "wrangler": "^4.22.0"
+  }
+}
