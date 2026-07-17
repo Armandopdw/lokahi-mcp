@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 const API_BASE = "https://app.lokahi.life/_/api/v1";
+const ANVIL_APP = "https://app.lokahi.life";
 
 // ── API helper ──
 
@@ -45,6 +46,339 @@ function result(data) {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
 }
 
+// ── OAuth helpers ──
+
+function generateToken(bytes = 32) {
+  const array = new Uint8Array(bytes);
+  crypto.getRandomValues(array);
+  return Array.from(array, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Base64url(input) {
+  const encoded = new TextEncoder().encode(input);
+  const hash = await crypto.subtle.digest("SHA-256", encoded);
+  return btoa(String.fromCharCode(...new Uint8Array(hash)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+async function parseTokenBody(request) {
+  const ct = request.headers.get("content-type") || "";
+  if (ct.includes("application/x-www-form-urlencoded")) {
+    const text = await request.text();
+    return Object.fromEntries(new URLSearchParams(text));
+  }
+  return request.json();
+}
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function oauthError(error, description, status = 400) {
+  return jsonResponse({ error, error_description: description }, status);
+}
+
+// ── OAuth endpoints ──
+
+function handleDiscovery(host) {
+  return jsonResponse({
+    issuer: `https://${host}`,
+    authorization_endpoint: `https://${host}/oauth/authorize`,
+    token_endpoint: `https://${host}/oauth/token`,
+    registration_endpoint: `https://${host}/oauth/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["client_secret_post"],
+  });
+}
+
+async function handleRegister(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return oauthError("invalid_request", "Invalid JSON body");
+  }
+
+  const { redirect_uris, client_name } = body;
+  if (!redirect_uris || !Array.isArray(redirect_uris) || redirect_uris.length === 0) {
+    return oauthError("invalid_request", "redirect_uris is required and must be a non-empty array");
+  }
+
+  const client_id = generateToken(16);
+  const client_secret = generateToken(32);
+  const clientData = { client_id, client_secret, redirect_uris, client_name: client_name || "" };
+
+  await env.OAUTH_KV.put(`client:${client_id}`, JSON.stringify(clientData), {
+    expirationTtl: 365 * 24 * 60 * 60,
+  });
+
+  return jsonResponse({
+    client_id,
+    client_secret,
+    redirect_uris,
+    client_name: clientData.client_name,
+  }, 201);
+}
+
+async function handleAuthorize(request, env) {
+  const url = new URL(request.url);
+  const client_id = url.searchParams.get("client_id");
+  const redirect_uri = url.searchParams.get("redirect_uri");
+  const state = url.searchParams.get("state");
+  const code_challenge = url.searchParams.get("code_challenge");
+  const code_challenge_method = url.searchParams.get("code_challenge_method");
+  const response_type = url.searchParams.get("response_type");
+
+  if (!client_id || !redirect_uri || !response_type) {
+    return oauthError("invalid_request", "Missing required parameters: client_id, redirect_uri, response_type");
+  }
+
+  if (response_type !== "code") {
+    return oauthError("unsupported_response_type", "Only response_type=code is supported");
+  }
+
+  const clientRaw = await env.OAUTH_KV.get(`client:${client_id}`);
+  if (!clientRaw) {
+    return oauthError("invalid_client", "Unknown client_id", 401);
+  }
+
+  const client = JSON.parse(clientRaw);
+  if (!client.redirect_uris.includes(redirect_uri)) {
+    return oauthError("invalid_request", "redirect_uri not registered for this client");
+  }
+
+  const session_id = generateToken(16);
+  const sessionData = { client_id, redirect_uri, state, code_challenge, code_challenge_method };
+
+  await env.OAUTH_KV.put(`session:${session_id}`, JSON.stringify(sessionData), {
+    expirationTtl: 600,
+  });
+
+  const host = url.host;
+  const callbackUrl = `https://${host}/oauth/callback`;
+  const consentUrl = `${ANVIL_APP}/#oauth-consent?session_id=${session_id}&callback_url=${encodeURIComponent(callbackUrl)}`;
+
+  return Response.redirect(consentUrl, 302);
+}
+
+async function handleCallback(request, env) {
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
+  const session_id = url.searchParams.get("session_id");
+  const error = url.searchParams.get("error");
+
+  if (!session_id) {
+    return oauthError("invalid_request", "Missing session_id");
+  }
+
+  const sessionRaw = await env.OAUTH_KV.get(`session:${session_id}`);
+  if (!sessionRaw) {
+    return oauthError("invalid_request", "Session expired or invalid", 400);
+  }
+
+  const session = JSON.parse(sessionRaw);
+  await env.OAUTH_KV.delete(`session:${session_id}`);
+
+  if (error) {
+    const redirectUrl = new URL(session.redirect_uri);
+    redirectUrl.searchParams.set("error", error);
+    if (session.state) redirectUrl.searchParams.set("state", session.state);
+    return Response.redirect(redirectUrl.toString(), 302);
+  }
+
+  if (!code) {
+    return oauthError("invalid_request", "Missing code parameter");
+  }
+
+  // Exchange code with Anvil
+  let userData;
+  try {
+    const exchangeRes = await fetch(`${ANVIL_APP}/_/api/oauth/exchange`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code, secret: env.ANVIL_OAUTH_SECRET }),
+    });
+
+    if (!exchangeRes.ok) {
+      const errText = await exchangeRes.text();
+      return oauthError("server_error", `Anvil code exchange failed: ${errText}`, 502);
+    }
+
+    userData = await exchangeRes.json();
+  } catch (err) {
+    return oauthError("server_error", `Anvil code exchange error: ${err.message}`, 502);
+  }
+
+  // Generate auth code for the client
+  const authCode = generateToken(24);
+  const codeData = {
+    client_id: session.client_id,
+    redirect_uri: session.redirect_uri,
+    code_challenge: session.code_challenge,
+    code_challenge_method: session.code_challenge_method,
+    email: userData.email,
+    name: userData.name,
+    is_practitioner: userData.is_practitioner,
+    api_key: userData.api_key,
+  };
+
+  await env.OAUTH_KV.put(`code:${authCode}`, JSON.stringify(codeData), {
+    expirationTtl: 300,
+  });
+
+  const redirectUrl = new URL(session.redirect_uri);
+  redirectUrl.searchParams.set("code", authCode);
+  if (session.state) redirectUrl.searchParams.set("state", session.state);
+
+  return Response.redirect(redirectUrl.toString(), 302);
+}
+
+async function handleToken(request, env) {
+  let body;
+  try {
+    body = await parseTokenBody(request);
+  } catch {
+    return oauthError("invalid_request", "Invalid request body");
+  }
+
+  const { grant_type } = body;
+
+  if (grant_type === "authorization_code") {
+    return handleAuthorizationCodeGrant(body, env);
+  } else if (grant_type === "refresh_token") {
+    return handleRefreshTokenGrant(body, env);
+  } else {
+    return oauthError("unsupported_grant_type", `Unsupported grant_type: ${grant_type}`);
+  }
+}
+
+async function handleAuthorizationCodeGrant(body, env) {
+  const { code, code_verifier, client_id, client_secret, redirect_uri } = body;
+
+  if (!code || !code_verifier) {
+    return oauthError("invalid_request", "Missing code or code_verifier");
+  }
+
+  const codeRaw = await env.OAUTH_KV.get(`code:${code}`);
+  if (!codeRaw) {
+    return oauthError("invalid_grant", "Authorization code expired or invalid");
+  }
+
+  const codeData = JSON.parse(codeRaw);
+
+  // Verify client
+  if (client_id && codeData.client_id !== client_id) {
+    return oauthError("invalid_grant", "client_id mismatch");
+  }
+
+  // Verify redirect_uri if provided
+  if (redirect_uri && codeData.redirect_uri !== redirect_uri) {
+    return oauthError("invalid_grant", "redirect_uri mismatch");
+  }
+
+  // Verify PKCE
+  if (codeData.code_challenge) {
+    const computed = await sha256Base64url(code_verifier);
+    if (computed !== codeData.code_challenge) {
+      return oauthError("invalid_grant", "PKCE code_verifier verification failed");
+    }
+  }
+
+  // Delete the auth code (one-time use)
+  await env.OAUTH_KV.delete(`code:${code}`);
+
+  // Generate tokens
+  const access_token = generateToken(32);
+  const refresh_token = generateToken(32);
+
+  const tokenPayload = {
+    email: codeData.email,
+    name: codeData.name,
+    is_practitioner: codeData.is_practitioner,
+    api_key: codeData.api_key,
+  };
+
+  await env.OAUTH_KV.put(`access:${access_token}`, JSON.stringify(tokenPayload), {
+    expirationTtl: 3600,
+  });
+
+  await env.OAUTH_KV.put(`refresh:${refresh_token}`, JSON.stringify(tokenPayload), {
+    expirationTtl: 2592000,
+  });
+
+  return jsonResponse({
+    access_token,
+    token_type: "Bearer",
+    expires_in: 3600,
+    refresh_token,
+  });
+}
+
+async function handleRefreshTokenGrant(body, env) {
+  const { refresh_token } = body;
+
+  if (!refresh_token) {
+    return oauthError("invalid_request", "Missing refresh_token");
+  }
+
+  const refreshRaw = await env.OAUTH_KV.get(`refresh:${refresh_token}`);
+  if (!refreshRaw) {
+    return oauthError("invalid_grant", "Refresh token expired or invalid");
+  }
+
+  const refreshData = JSON.parse(refreshRaw);
+
+  // Validate user is still active with Anvil
+  try {
+    const validateRes = await fetch(`${ANVIL_APP}/_/api/oauth/validate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: refreshData.email, secret: env.ANVIL_OAUTH_SECRET }),
+    });
+
+    if (!validateRes.ok) {
+      await env.OAUTH_KV.delete(`refresh:${refresh_token}`);
+      return oauthError("invalid_grant", "User validation failed");
+    }
+
+    const validateData = await validateRes.json();
+    if (!validateData.active) {
+      await env.OAUTH_KV.delete(`refresh:${refresh_token}`);
+      return oauthError("invalid_grant", "User account is no longer active");
+    }
+  } catch (err) {
+    return oauthError("server_error", `User validation error: ${err.message}`, 502);
+  }
+
+  // Generate new access token
+  const access_token = generateToken(32);
+
+  const tokenPayload = {
+    email: refreshData.email,
+    name: refreshData.name,
+    is_practitioner: refreshData.is_practitioner,
+    api_key: refreshData.api_key,
+  };
+
+  await env.OAUTH_KV.put(`access:${access_token}`, JSON.stringify(tokenPayload), {
+    expirationTtl: 3600,
+  });
+
+  return jsonResponse({
+    access_token,
+    token_type: "Bearer",
+    expires_in: 3600,
+    refresh_token,
+  });
+}
+
 // ── MCP Server ──
 
 export class LokahiMCP extends McpAgent {
@@ -58,7 +392,24 @@ export class LokahiMCP extends McpAgent {
   async fetch(request) {
     const auth = request.headers.get("Authorization");
     if (auth?.startsWith("Bearer ")) {
-      this._apiKey = auth.slice(7);
+      const token = auth.slice(7);
+      if (token.startsWith("lok_live_")) {
+        // Direct API key
+        this._apiKey = token;
+      } else {
+        // OAuth access token — look up in KV
+        try {
+          const tokenRaw = await this.env.OAUTH_KV.get(`access:${token}`);
+          if (tokenRaw) {
+            const tokenData = JSON.parse(tokenRaw);
+            this._apiKey = tokenData.api_key;
+          } else {
+            this._apiKey = token; // Let it fail downstream with a clear error
+          }
+        } catch {
+          this._apiKey = token;
+        }
+      }
     }
     if (!this._apiKey) {
       const url = new URL(request.url);
@@ -587,11 +938,29 @@ export default {
   fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // ── OAuth routes ──
+    if (url.pathname === "/.well-known/oauth-authorization-server") {
+      return handleDiscovery(url.host);
+    }
+    if (url.pathname === "/oauth/register" && request.method === "POST") {
+      return handleRegister(request, env);
+    }
+    if (url.pathname === "/oauth/authorize" && request.method === "GET") {
+      return handleAuthorize(request, env);
+    }
+    if (url.pathname === "/oauth/callback" && request.method === "GET") {
+      return handleCallback(request, env);
+    }
+    if (url.pathname === "/oauth/token" && request.method === "POST") {
+      return handleToken(request, env);
+    }
+
+    // ── Root info page ──
     if (url.pathname === "/") {
       return new Response(
         JSON.stringify({
           name: "Lokahi MCP Server",
-          description: "MCP server for the Lokahi wellness marketplace. Connect via /sse with your API key.",
+          description: "MCP server for the Lokahi wellness marketplace. Connect via /sse with your API key, or use OAuth for Claude.ai / ChatGPT.",
           docs: "https://app.lokahi.life/_/api/v1/docs",
           openapi: "https://app.lokahi.life/_/api/v1/openapi.json",
         }),
@@ -599,6 +968,7 @@ export default {
       );
     }
 
+    // ── MCP SSE ──
     return LokahiMCP.serve(url.pathname).fetch(request, env, ctx);
   },
 };

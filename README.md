@@ -10,6 +10,24 @@ Lets AI assistants (Claude, ChatGPT, Cursor, etc.) search for practitioners, boo
 npm install
 ```
 
+### KV Namespace
+
+Create the KV namespace for OAuth state storage:
+
+```bash
+wrangler kv namespace create OAUTH_KV
+```
+
+Copy the output ID and update `wrangler.jsonc` — replace `PLACEHOLDER_KV_ID` with the actual namespace ID.
+
+### Secrets
+
+Set the shared secret used for the Worker-to-Anvil private handshake (must match the value configured in Anvil):
+
+```bash
+wrangler secret put ANVIL_OAUTH_SECRET
+```
+
 ## Development
 
 ```bash
@@ -24,23 +42,37 @@ npm run deploy
 
 ## Authentication
 
-The MCP server authenticates via **Bearer token**. Generate an API key from your Lokahi account at **Settings → API Access** on [app.lokahi.life](https://app.lokahi.life/settings). Keys start with `lok_live_` and are shown once at creation time.
+The MCP server supports two authentication methods:
+
+### OAuth (recommended for Claude.ai / ChatGPT)
+
+Select **OAuth** in your connector settings. The Worker handles the full OAuth 2.0 flow automatically:
+
+1. You are redirected to Lokahi to log in and grant consent.
+2. After approval, the Worker exchanges the authorization for tokens.
+3. Access tokens expire after 1 hour; refresh tokens last 30 days and re-validate with Anvil that the user is still active.
+
+The Worker implements spec-compliant OAuth with PKCE, discovery (`/.well-known/oauth-authorization-server`), and dynamic client registration (`/oauth/register`).
+
+### API Key (direct — for Claude Desktop, Cursor, Claude Code)
+
+Generate an API key from your Lokahi account at **Settings > API Access** on [app.lokahi.life](https://app.lokahi.life/settings). Keys start with `lok_live_` and are shown once at creation time.
 
 The server accepts the API key in two ways (checked in order):
 1. `Authorization: Bearer lok_live_...` header (preferred)
 2. `?apiKey=lok_live_...` query parameter (fallback)
 
-Public tools (search, practitioner profiles) work without auth. Seeker and practitioner tools require a valid API key.
+Public tools (search, practitioner profiles) work without auth. Seeker and practitioner tools require authentication.
 
 ## Connecting
 
 ### Claude.ai (remote MCP)
 
-1. Go to **Claude.ai → Settings → Connectors → Add MCP Server**
+1. Go to **Claude.ai > Settings > Connectors > Add MCP Server**
 2. URL: `https://lokahi-mcp.<your-subdomain>.workers.dev/sse`
-3. Add your API key as a custom header: `Authorization: Bearer lok_live_...`
+3. Authentication: select **OAuth** — the login flow is handled automatically
 
-### Claude Desktop / Cursor
+### Claude Desktop / Cursor / Claude Code
 
 Add to your MCP config (e.g. `~/.claude/claude_desktop_config.json`):
 
@@ -57,15 +89,15 @@ Add to your MCP config (e.g. `~/.claude/claude_desktop_config.json`):
 }
 ```
 
-### ChatGPT (GPT Actions)
+### ChatGPT (GPT Actions / Connectors)
 
-ChatGPT uses OpenAPI specs directly instead of MCP. Point it at the OpenAPI endpoint:
+ChatGPT supports OAuth connectors. Point it at the Worker URL and select OAuth authentication — the discovery endpoint at `/.well-known/oauth-authorization-server` provides all the configuration automatically.
+
+Alternatively, use the OpenAPI spec directly:
 
 ```
 https://app.lokahi.life/_/api/v1/openapi.json
 ```
-
-Then configure authentication as API key with `Bearer` prefix in the Authorization header.
 
 ## Available Tools
 
