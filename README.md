@@ -40,6 +40,14 @@ npm run dev
 npm run deploy
 ```
 
+> **Note:** Wrangler requires Node >= 22. If you use nvm and Anvil CLI is installed, `~/.npmrc` has a `prefix` setting that conflicts with nvm. Workaround:
+> ```bash
+> mv ~/.npmrc ~/.npmrc.bak
+> nvm use 22
+> npx wrangler deploy
+> mv ~/.npmrc.bak ~/.npmrc
+> ```
+
 ## Authentication
 
 The MCP server supports two authentication methods:

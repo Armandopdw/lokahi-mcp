@@ -83,6 +83,17 @@ function oauthError(error, description, status = 400) {
   return jsonResponse({ error, error_description: description }, status);
 }
 
+function unauthorizedResponse(host) {
+  const resourceMetadata = `https://${host}/.well-known/oauth-protected-resource`;
+  return new Response(JSON.stringify({ error: "unauthorized", error_description: "Bearer token required" }), {
+    status: 401,
+    headers: {
+      "Content-Type": "application/json",
+      "WWW-Authenticate": `Bearer resource_metadata="${resourceMetadata}"`,
+    },
+  });
+}
+
 // ── OAuth endpoints ──
 
 function handleProtectedResource(host) {
@@ -143,6 +154,7 @@ async function handleAuthorize(request, env) {
   const code_challenge = url.searchParams.get("code_challenge");
   const code_challenge_method = url.searchParams.get("code_challenge_method");
   const response_type = url.searchParams.get("response_type");
+  const resource = url.searchParams.get("resource");
 
   if (!client_id || !redirect_uri || !response_type) {
     return oauthError("invalid_request", "Missing required parameters: client_id, redirect_uri, response_type");
@@ -163,7 +175,7 @@ async function handleAuthorize(request, env) {
   }
 
   const session_id = generateToken(16);
-  const sessionData = { client_id, redirect_uri, state, code_challenge, code_challenge_method };
+  const sessionData = { client_id, redirect_uri, state, code_challenge, code_challenge_method, resource };
 
   await env.OAUTH_KV.put(`session:${session_id}`, JSON.stringify(sessionData), {
     expirationTtl: 600,
@@ -231,6 +243,7 @@ async function handleCallback(request, env) {
     redirect_uri: session.redirect_uri,
     code_challenge: session.code_challenge,
     code_challenge_method: session.code_challenge_method,
+    resource: session.resource,
     email: userData.email,
     name: userData.name,
     is_practitioner: userData.is_practitioner,
@@ -268,7 +281,7 @@ async function handleToken(request, env) {
 }
 
 async function handleAuthorizationCodeGrant(body, env) {
-  const { code, code_verifier, client_id, client_secret, redirect_uri } = body;
+  const { code, code_verifier, client_id, client_secret, redirect_uri, resource } = body;
 
   if (!code || !code_verifier) {
     return oauthError("invalid_request", "Missing code or code_verifier");
@@ -291,6 +304,11 @@ async function handleAuthorizationCodeGrant(body, env) {
     return oauthError("invalid_grant", "redirect_uri mismatch");
   }
 
+  // Verify resource parameter matches what was sent during authorization
+  if (resource && codeData.resource && resource !== codeData.resource) {
+    return oauthError("invalid_grant", "resource mismatch");
+  }
+
   // Verify PKCE
   if (codeData.code_challenge) {
     const computed = await sha256Base64url(code_verifier);
@@ -311,6 +329,7 @@ async function handleAuthorizationCodeGrant(body, env) {
     name: codeData.name,
     is_practitioner: codeData.is_practitioner,
     api_key: codeData.api_key,
+    resource: codeData.resource,
   };
 
   await env.OAUTH_KV.put(`access:${access_token}`, JSON.stringify(tokenPayload), {
@@ -1018,6 +1037,12 @@ export default {
       }
     }
     ctx.props = { apiKey };
+
+    // ── Return 401 with WWW-Authenticate for unauthenticated MCP requests ──
+    if (!apiKey && request.method === "POST") {
+      console.log("[Worker] → 401 unauthenticated MCP request");
+      return unauthorizedResponse(url.host);
+    }
 
     // ── MCP — serve at root for Streamable HTTP + SSE ──
     console.log(`[Worker] → MCP serve for ${url.pathname} (${request.method})`);
