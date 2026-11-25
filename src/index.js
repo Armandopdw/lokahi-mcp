@@ -2,8 +2,8 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-const API_BASE = "https://app.lokahi.life/_/api/v1";
-const ANVIL_APP = "https://app.lokahi.life";
+const API_BASE = "https://lokahi.life/_/api/v1";
+const ANVIL_APP = "https://lokahi.life";
 
 // ── API helper ──
 
@@ -1052,8 +1052,8 @@ export default {
         JSON.stringify({
           name: "Lokahi MCP Server",
           description: "MCP server for the Lokahi wellness marketplace. Connect with your API key or use OAuth for Claude.ai / ChatGPT.",
-          docs: "https://app.lokahi.life/_/api/v1/docs",
-          openapi: "https://app.lokahi.life/_/api/v1/openapi.json",
+          docs: "https://lokahi.life/_/api/v1/docs",
+          openapi: "https://lokahi.life/_/api/v1/openapi.json",
         }),
         { headers: { "Content-Type": "application/json", ...CORS_HEADERS } }
       );
