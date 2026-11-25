@@ -72,10 +72,16 @@ async function parseTokenBody(request) {
   return request.json();
 }
 
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, MCP-Protocol-Version",
+};
+
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
   });
 }
 
@@ -90,6 +96,7 @@ function unauthorizedResponse(host) {
     headers: {
       "Content-Type": "application/json",
       "WWW-Authenticate": `Bearer resource_metadata="${resourceMetadata}"`,
+      ...CORS_HEADERS,
     },
   });
 }
@@ -101,6 +108,7 @@ function handleProtectedResource(host) {
     resource: `https://${host}`,
     authorization_servers: [`https://${host}`],
     bearer_methods_supported: ["header"],
+    scopes_supported: [],
   });
 }
 
@@ -113,7 +121,8 @@ function handleDiscovery(host) {
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
-    token_endpoint_auth_methods_supported: ["client_secret_post"],
+    token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
+    client_id_metadata_document_supported: true,
   });
 }
 
@@ -125,25 +134,41 @@ async function handleRegister(request, env) {
     return oauthError("invalid_request", "Invalid JSON body");
   }
 
-  const { redirect_uris, client_name } = body;
+  const { redirect_uris, client_name, token_endpoint_auth_method, grant_types, response_types } = body;
   if (!redirect_uris || !Array.isArray(redirect_uris) || redirect_uris.length === 0) {
     return oauthError("invalid_request", "redirect_uris is required and must be a non-empty array");
   }
 
+  const isPublic = token_endpoint_auth_method === "none";
   const client_id = generateToken(16);
-  const client_secret = generateToken(32);
-  const clientData = { client_id, client_secret, redirect_uris, client_name: client_name || "" };
+  const clientData = {
+    client_id,
+    redirect_uris,
+    client_name: client_name || "",
+    token_endpoint_auth_method: isPublic ? "none" : "client_secret_post",
+  };
+
+  if (!isPublic) {
+    clientData.client_secret = generateToken(32);
+  }
 
   await env.OAUTH_KV.put(`client:${client_id}`, JSON.stringify(clientData), {
     expirationTtl: 365 * 24 * 60 * 60,
   });
 
-  return jsonResponse({
+  const response = {
     client_id,
-    client_secret,
     redirect_uris,
     client_name: clientData.client_name,
-  }, 201);
+    token_endpoint_auth_method: clientData.token_endpoint_auth_method,
+    grant_types: grant_types || ["authorization_code"],
+    response_types: response_types || ["code"],
+  };
+  if (!isPublic) {
+    response.client_secret = clientData.client_secret;
+  }
+
+  return jsonResponse(response, 201);
 }
 
 async function handleAuthorize(request, env) {
@@ -299,6 +324,19 @@ async function handleAuthorizationCodeGrant(body, env) {
     return oauthError("invalid_grant", "client_id mismatch");
   }
 
+  // Verify client_secret for confidential clients
+  if (client_id) {
+    const clientRaw = await env.OAUTH_KV.get(`client:${client_id}`);
+    if (clientRaw) {
+      const client = JSON.parse(clientRaw);
+      if (client.token_endpoint_auth_method !== "none") {
+        if (!client_secret || client_secret !== client.client_secret) {
+          return oauthError("invalid_client", "Invalid client_secret", 401);
+        }
+      }
+    }
+  }
+
   // Verify redirect_uri if provided
   if (redirect_uri && codeData.redirect_uri !== redirect_uri) {
     return oauthError("invalid_grant", "redirect_uri mismatch");
@@ -309,7 +347,10 @@ async function handleAuthorizationCodeGrant(body, env) {
     return oauthError("invalid_grant", "resource mismatch");
   }
 
-  // Verify PKCE
+  // Verify PKCE (required for public clients, optional for confidential)
+  if (!codeData.code_challenge && !client_secret) {
+    return oauthError("invalid_request", "PKCE code_challenge is required for public clients");
+  }
   if (codeData.code_challenge) {
     const computed = await sha256Base64url(code_verifier);
     if (computed !== codeData.code_challenge) {
@@ -974,6 +1015,11 @@ export default {
     const url = new URL(request.url);
     console.log(`[Worker] ${request.method} ${url.pathname}`);
 
+    // ── CORS preflight ──
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
     // ── OAuth routes ──
     if (url.pathname === "/.well-known/oauth-protected-resource") {
       console.log("[Worker] → protected-resource metadata");
@@ -1009,7 +1055,7 @@ export default {
           docs: "https://app.lokahi.life/_/api/v1/docs",
           openapi: "https://app.lokahi.life/_/api/v1/openapi.json",
         }),
-        { headers: { "Content-Type": "application/json" } }
+        { headers: { "Content-Type": "application/json", ...CORS_HEADERS } }
       );
     }
 
@@ -1039,20 +1085,22 @@ export default {
     ctx.props = { apiKey };
 
     // ── Return 401 with WWW-Authenticate for unauthenticated MCP requests ──
-    if (!apiKey && request.method === "POST") {
+    if (!apiKey && url.pathname.startsWith("/mcp") && request.method === "POST") {
       console.log("[Worker] → 401 unauthenticated MCP request");
       return unauthorizedResponse(url.host);
     }
 
-    // ── MCP — serve at root for Streamable HTTP + SSE ──
+    // ── MCP — serve at /mcp for Streamable HTTP ──
     console.log(`[Worker] → MCP serve for ${url.pathname} (${request.method})`);
     try {
-      const resp = await LokahiMCP.serve("/").fetch(request, env, ctx);
+      const resp = await LokahiMCP.serve("/mcp").fetch(request, env, ctx);
       console.log(`[Worker] MCP serve response: ${resp.status}`);
-      return resp;
+      const corsResp = new Response(resp.body, resp);
+      for (const [k, v] of Object.entries(CORS_HEADERS)) corsResp.headers.set(k, v);
+      return corsResp;
     } catch (err) {
       console.error(`[Worker] MCP serve error: ${err.message}\n${err.stack}`);
-      return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+      return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json", ...CORS_HEADERS } });
     }
   },
 };
